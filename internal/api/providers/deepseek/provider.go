@@ -463,7 +463,7 @@ func buildPrompt(system string, messages []api.Message, tools []api.Tool) string
 		}
 	}
 
-	parts = append(parts, "\nRespond with the next assistant turn. To call a tool, output a JSON object like {\"tool_calls\":[{\"name\":\"...\",\"arguments\":{...}}]} on its own line (no markdown fences).")
+	parts = append(parts, "\nRespond with the next assistant turn. To call a tool, output this exact XML format (no markdown fences):\n<tool_calls><tool name=\"...\"><arg name=\"...\">value</arg></tool></tool_calls>\nDo NOT use JSON format like {\"tool_calls\":[...]}. Use XML only.")
 
 	return strings.Join(parts, "\n\n")
 }
@@ -483,7 +483,7 @@ func describeTools(tools []api.Tool) string {
 		return ""
 	}
 	var lines []string
-	lines = append(lines, "Available tools (output as JSON: {\"tool_calls\":[{\"name\":...,\"arguments\":{...}}]}):")
+	lines = append(lines, "Available tools (call using XML: <tool_calls><tool name=\"...\"><arg name=\"...\">value</arg></tool></tool_calls>):")
 	for _, t := range tools {
 		lines = append(lines, fmt.Sprintf("- %s: %s", t.Name, t.Description))
 		var props []string
