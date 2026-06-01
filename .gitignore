@@ -1,0 +1,6 @@
+claw-code-go
+*.exe
+*.test
+.env
+.pi/
+node_modules/
