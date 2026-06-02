@@ -5,6 +5,7 @@ import "github.com/charmbracelet/lipgloss"
 // Theme defines the named color tokens used throughout the TUI.
 // All lipgloss styles are derived from the active theme.
 type Theme struct {
+	Name           string         // short identifier ("dark" | "light") for glamour
 	Primary        lipgloss.Color // app accent (header, spinner)
 	Secondary      lipgloss.Color // secondary accent (overlay borders)
 	Success        lipgloss.Color // positive outcomes
@@ -24,6 +25,7 @@ type Theme struct {
 
 // DarkTheme is the default color scheme for dark-background terminals.
 var DarkTheme = Theme{
+	Name:           "dark",
 	Primary:        "205",
 	Secondary:      "62",
 	Success:        "82",
@@ -43,6 +45,7 @@ var DarkTheme = Theme{
 
 // LightTheme is a color scheme for light-background terminals.
 var LightTheme = Theme{
+	Name:           "light",
 	Primary:        "125",
 	Secondary:      "61",
 	Success:        "28",

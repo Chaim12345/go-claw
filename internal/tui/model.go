@@ -3,8 +3,10 @@ package tui
 import (
 	"claw-code-go/internal/auth"
 	"claw-code-go/internal/config"
+	"claw-code-go/internal/permissions"
 	"claw-code-go/internal/runtime"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -78,6 +80,10 @@ const (
 	stateLoginAPIKey                    // /login: API key text input
 	stateLoginOAuth                     // /login: waiting for OAuth browser flow
 	stateAskUser                        // agent has asked the user a question
+	statePalette                        // command palette overlay (Ctrl+P)
+	stateSessionPicker                  // session browser overlay
+	stateMention                        // @-file autocomplete popup
+	stateTodoPanel                      // todo list sidebar visible
 )
 
 // Bubble Tea messages for async streaming events.
@@ -153,6 +159,14 @@ type Model struct {
 	loginProvider string          // provider selected during login
 	loginKeyInput textinput.Model // API key entry input (single-line, masked)
 
+	// new opencode-style feature state
+	palette        *palette
+	sessionPicker  *sessionPicker
+	mention        *mentionAutocomplete
+	todoPanel      *todoPanel
+	toolCards      []toolCard
+	permModeOrder  []permissions.PermissionMode
+
 	// app deps
 	loop *runtime.ConversationLoop
 	cfg  *runtime.Config
@@ -174,13 +188,23 @@ func NewModel(cfg *runtime.Config, loop *runtime.ConversationLoop) Model {
 	s.Style = lipgloss.NewStyle().Foreground(currentTheme.Primary)
 
 	return Model{
-		state:    stateInput,
-		textarea: ta,
-		spinner:  s,
-		history:  newInputHistory(),
-		loop:     loop,
-		cfg:      cfg,
-		viewBuf:  RenderLogo(appVersion),
+		state:         stateInput,
+		textarea:      ta,
+		spinner:       s,
+		history:       newInputHistory(),
+		loop:          loop,
+		cfg:           cfg,
+		viewBuf:       RenderLogo(appVersion),
+		palette:       newPalette(),
+		sessionPicker: newSessionPicker(),
+		mention:       newMentionAutocomplete(),
+		todoPanel:     newTodoPanel(),
+		permModeOrder: []permissions.PermissionMode{
+			permissions.ModeDefault,
+			permissions.ModeAcceptEdits,
+			permissions.ModeBypassPermissions,
+			permissions.ModePlan,
+		},
 	}
 }
 
@@ -221,18 +245,40 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if !m.hasStreamContent {
 			m.hasStreamContent = true
 		}
-		line := toolRunningStyle.Render(fmt.Sprintf("  ◆ %s: %s\n", msg.name, truncate(msg.input, 60)))
-		m.streamBuf += line
+		// Track the tool call as a card so the user can expand it
+		// later with Ctrl+T. The first event for a tool is "running";
+		// we still create a card so the start line is visible.
+		card := toolCard{
+			id:    fmt.Sprintf("tc_%d", len(m.toolCards)),
+			name:  msg.name,
+			input: msg.input,
+		}
+		if msg.name == "edit" || msg.name == "write" || msg.name == "file_edit" || msg.name == "write_file" {
+			card.hasDiff = true
+		}
+		m.toolCards = append(m.toolCards, card)
+		m.streamBuf += formatToolCard(card) + "\n"
+		// If the agent updated the todo list, refresh the panel.
+		if msg.name == "todo_write" {
+			m.refreshTodosFromDisk()
+		}
 		m = m.refreshViewport()
 		return m, waitForStream(m.streamChan)
 
 	case streamToolDoneMsg:
-		suffix := ""
-		if msg.result != "" {
-			suffix = " → " + truncate(msg.result, 40)
+		// Update the most recent matching card with the result. If the
+		// tool wrote/edited a file, attempt to compute an inline diff
+		// for the card so the user can see the change visually.
+		for i := len(m.toolCards) - 1; i >= 0; i-- {
+			if m.toolCards[i].name == msg.name && m.toolCards[i].result == "" {
+				m.toolCards[i].result = msg.result
+				if m.toolCards[i].hasDiff {
+					m.toolCards[i].diffInline = m.computeToolDiff(m.toolCards[i])
+				}
+				break
+			}
 		}
-		line := toolDoneStyle.Render(fmt.Sprintf("  ✓ %s%s\n", msg.name, suffix))
-		m.streamBuf += line
+		m.streamBuf = m.renderToolCards() + "\n"
 		m = m.refreshViewport()
 		return m, waitForStream(m.streamChan)
 
@@ -242,14 +288,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, waitForStream(m.streamChan)
 
 	case streamDoneMsg:
-		// Commit streamBuf to viewBuf with token annotation.
+		// Commit streamBuf to viewBuf with token annotation. The text
+		// portions of the buffer get routed through glamour for
+		// markdown rendering; tool card lines are passed through as-is
+		// because they're already styled.
 		if m.streamBuf != "" || m.hasStreamContent {
+			rendered := renderBufferSegments(m.streamBuf)
 			tokLine := statusStyle.Render(fmt.Sprintf(
 				"\n\nTokens: %s in / %s out\n\n",
 				formatNum(m.inputTokens),
 				formatNum(m.outputTokens),
 			))
-			m.viewBuf += m.streamBuf + tokLine
+			m.viewBuf += rendered + tokLine
 			m.streamBuf = ""
 		}
 		m.hasStreamContent = false
@@ -309,6 +359,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // handleKey dispatches key events based on current state.
 func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch m.state {
+	case statePalette:
+		return m.handlePaletteKey(msg)
+	case stateSessionPicker:
+		return m.handleSessionPickerKey(msg)
+	case stateMention:
+		return m.handleMentionKey(msg)
 	case statePicker:
 		return m.handlePickerKey(msg)
 	case stateHelp:
@@ -337,9 +393,34 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case tea.KeyCtrlC:
 		return m, tea.Quit
 
+	case tea.KeyCtrlP:
+		// Open the command palette (opencode's signature key binding).
+		m.palette.open(m.cfg.ProviderName)
+		m.state = statePalette
+		return m, nil
+
+	case tea.KeyShiftTab:
+		// Cycle the permission mode.
+		return m.cyclePermissionMode()
+
+	case tea.KeyCtrlT:
+		// Toggle the most recent tool card (opencode behaviour).
+		return m.toggleLastToolCard()
+
 	case tea.KeyEnter:
 		// Submit the message.
 		return m.handleSubmit()
+
+	case tea.KeyTab:
+		// If the @-mention popup is active, Tab inserts the highlighted file.
+		if m.mention.active && len(m.mention.matches) > 0 {
+			return m.applyMentionSelection()
+		}
+		// Otherwise, fall through to textarea.
+		m.history.Reset()
+		var cmd tea.Cmd
+		m.textarea, cmd = m.textarea.Update(msg)
+		return m, cmd
 
 	case tea.KeyCtrlJ:
 		// Ctrl+J inserts a real newline into the multi-line input.
@@ -383,6 +464,12 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.history.Reset()
 		var cmd tea.Cmd
 		m.textarea, cmd = m.textarea.Update(msg)
+		// After every keystroke, refresh the @-mention popup.
+		if m.mention.update(m.textarea.Value()) {
+			m.state = stateMention
+		} else if m.state == stateMention {
+			m.state = stateInput
+		}
 		return m, cmd
 	}
 }
@@ -481,6 +568,20 @@ func (m Model) handleSlashCommand(cmd string) (tea.Model, tea.Cmd) {
 	case "/session":
 		return m.handleSessionCommand(parts)
 
+	case "/todo":
+		m.todoPanel.toggle()
+		if m.todoPanel.visible {
+			m.refreshTodosFromDisk()
+			m.viewBuf += statusStyle.Render("Todo panel: on\n\n")
+		} else {
+			m.viewBuf += statusStyle.Render("Todo panel: off\n\n")
+		}
+		m = m.refreshViewport()
+		return m, nil
+
+	case "/sessions":
+		return m.openSessionPicker()
+
 	case "/status":
 		return m.handleStatus()
 
@@ -534,14 +635,13 @@ func (m Model) handleSessionCommand(parts []string) (tea.Model, tea.Cmd) {
 		}
 	case "load":
 		if len(parts) < 3 {
-			m.viewBuf += errorStyle.Render("Usage: /session load <name>\n\n")
+			return m.openSessionPicker()
+		}
+		id := parts[2]
+		if err := m.loop.LoadNamedSession(id); err != nil {
+			m.viewBuf += errorStyle.Render(fmt.Sprintf("Error loading session %q: %v\n\n", id, err))
 		} else {
-			id := parts[2]
-			if err := m.loop.LoadNamedSession(id); err != nil {
-				m.viewBuf += errorStyle.Render(fmt.Sprintf("Error loading session %q: %v\n\n", id, err))
-			} else {
-				m.viewBuf += statusStyle.Render(fmt.Sprintf("Session loaded: %s (%d messages)\n\n", id, m.loop.MessageCount()))
-			}
+			m.viewBuf += statusStyle.Render(fmt.Sprintf("Session loaded: %s (%d messages)\n\n", id, m.loop.MessageCount()))
 		}
 	default:
 		m.viewBuf += errorStyle.Render(fmt.Sprintf("Unknown /session subcommand %q. Usage: /session list|save|load <name>\n\n", sub))
@@ -1017,6 +1117,338 @@ func (m Model) startMessage(text string) (tea.Model, tea.Cmd) {
 	)
 }
 
+// handlePaletteKey handles keys when the command palette is open.
+func (m Model) handlePaletteKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	chosen, shouldClose := m.palette.updateKey(msg)
+	if !shouldClose {
+		return m, nil
+	}
+	if chosen == nil {
+		m.palette.close()
+		m.state = stateInput
+		return m, nil
+	}
+	cmd := *chosen
+	m.palette.close()
+	m.state = stateInput
+
+	// Route the chosen command. System actions are handled directly;
+	// others are funnelled through the slash-command pipeline so the
+	// existing TUI code keeps a single source of truth.
+	if cmd.system != "" {
+		return m.runSystemAction(cmd.system)
+	}
+	if cmd.action != "" {
+		return m.handleSlashCommand("/" + cmd.action)
+	}
+	return m, nil
+}
+
+// runSystemAction executes a palette-only command that has no slash
+// equivalent. Kept tiny so the palette file stays UI-only.
+func (m Model) runSystemAction(system string) (tea.Model, tea.Cmd) {
+	switch system {
+	case "theme-toggle":
+		if currentTheme.Name == "dark" {
+			SetTheme(LightTheme)
+			m.viewBuf += statusStyle.Render("Theme: light.\n\n")
+		} else {
+			SetTheme(DarkTheme)
+			m.viewBuf += statusStyle.Render("Theme: dark.\n\n")
+		}
+		// Rebuild the markdown renderer to match the new theme.
+		_ = rebuildMarkdownRenderer()
+		m = m.refreshViewport()
+		return m, nil
+	case "clear":
+		m.loop.ClearSession()
+		m.viewBuf = statusStyle.Render("Session cleared.\n\n")
+		m.streamBuf = ""
+		m.inputTokens = 0
+		m.outputTokens = 0
+		m = m.refreshViewport()
+		return m, nil
+	case "toggle-mode":
+		return m.cyclePermissionMode()
+	case "open-session-picker":
+		return m.openSessionPicker()
+	case "toggle-todo":
+		m.todoPanel.toggle()
+		if m.todoPanel.visible {
+			m.refreshTodosFromDisk()
+			m.viewBuf += statusStyle.Render("Todo panel: on\n\n")
+		} else {
+			m.viewBuf += statusStyle.Render("Todo panel: off\n\n")
+		}
+		m = m.refreshViewport()
+		return m, nil
+	}
+	// "set-model <id>" — system actions can carry arguments after a space.
+	if strings.HasPrefix(system, "set-model ") {
+		id := strings.TrimPrefix(system, "set-model ")
+		m.cfg.Model = id
+		m.loop.Config.Model = id
+		m.viewBuf += statusStyle.Render(fmt.Sprintf("Model changed to %s\n\n", id))
+		m = m.refreshViewport()
+		return m, nil
+	}
+	return m, nil
+}
+
+// cyclePermissionMode advances the mode indicator to the next entry in
+// permModeOrder. The badge in the status bar reflects the change
+// immediately.
+func (m Model) cyclePermissionMode() (tea.Model, tea.Cmd) {
+	if m.loop == nil || m.loop.PermManager == nil {
+		m.viewBuf += warnStyle.Render("No active permission manager.\n\n")
+		m = m.refreshViewport()
+		return m, nil
+	}
+	cur := m.loop.PermManager.Mode
+	idx := 0
+	for i, p := range m.permModeOrder {
+		if p == cur {
+			idx = i
+			break
+		}
+	}
+	idx = (idx + 1) % len(m.permModeOrder)
+	next := m.permModeOrder[idx]
+	m.loop.PermManager.Mode = next
+	m.cfg.PermissionMode = next.String()
+	m.viewBuf += statusStyle.Render(fmt.Sprintf("Permission mode: %s\n\n", next))
+	m = m.refreshViewport()
+	return m, nil
+}
+
+// toggleLastToolCard flips the expanded state of the most recent tool
+// card. Mirrors opencode's Ctrl+T keybinding.
+func (m Model) toggleLastToolCard() (tea.Model, tea.Cmd) {
+	if len(m.toolCards) == 0 {
+		return m, nil
+	}
+	idx := len(m.toolCards) - 1
+	m.toolCards[idx].expanded = !m.toolCards[idx].expanded
+	m.streamBuf = m.renderToolCards()
+	m = m.refreshViewport()
+	return m, nil
+}
+
+// handleSessionPickerKey handles keys when the session picker is open.
+func (m Model) handleSessionPickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	id, shouldClose := m.sessionPicker.updateKey(msg)
+	if !shouldClose {
+		return m, nil
+	}
+	m.sessionPicker.close()
+	m.state = stateInput
+	if id == "" {
+		return m, nil
+	}
+	if err := m.loop.LoadNamedSession(id); err != nil {
+		m.viewBuf += errorStyle.Render(fmt.Sprintf("Error loading session %q: %v\n\n", id, err))
+	} else {
+		m.viewBuf += statusStyle.Render(fmt.Sprintf("Session loaded: %s (%d messages)\n\n", id, m.loop.MessageCount()))
+	}
+	m = m.refreshViewport()
+	return m, nil
+}
+
+// openSessionPicker fetches session metadata and opens the picker.
+func (m Model) openSessionPicker() (tea.Model, tea.Cmd) {
+	metas, err := m.loop.ListSessionsWithMeta()
+	if err != nil {
+		m.viewBuf += errorStyle.Render(fmt.Sprintf("Error listing sessions: %v\n\n", err))
+		m = m.refreshViewport()
+		return m, nil
+	}
+	converted := make([]runtimeSessionMeta, 0, len(metas))
+	for _, m := range metas {
+		converted = append(converted, runtimeSessionMeta{
+			id:             m.ID,
+			updated:        m.UpdatedAt.Format("2006-01-02 15:04:05"),
+			messageCount:   m.MessageCount,
+			totalInTokens:  m.TotalInputTokens,
+			totalOutTokens: m.TotalOutputTokens,
+		})
+	}
+	m.sessionPicker.open(converted)
+	m.state = stateSessionPicker
+	return m, nil
+}
+
+// handleMentionKey handles keys when the @-mention popup is active.
+func (m Model) handleMentionKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEsc:
+		// Cancel: drop the @-trigger and return to plain input.
+		m.mention.active = false
+		m.state = stateInput
+		return m, nil
+	case tea.KeyEnter:
+		return m.applyMentionSelection()
+	case tea.KeyTab:
+		return m.applyMentionSelection()
+	case tea.KeyUp:
+		m.mention.moveCursor(-1)
+		return m, nil
+	case tea.KeyDown:
+		m.mention.moveCursor(1)
+		return m, nil
+	case tea.KeyBackspace:
+		// Let the textarea handle the backspace; we'll re-evaluate the
+		// popup state via the default key path on the next render.
+		m.history.Reset()
+		var cmd tea.Cmd
+		m.textarea, cmd = m.textarea.Update(msg)
+		if !m.mention.update(m.textarea.Value()) {
+			m.state = stateInput
+		}
+		return m, cmd
+	}
+	// Default: pass through to textarea; re-evaluate mention state.
+	m.history.Reset()
+	var cmd tea.Cmd
+	m.textarea, cmd = m.textarea.Update(msg)
+	if !m.mention.update(m.textarea.Value()) {
+		m.state = stateInput
+	}
+	return m, cmd
+}
+
+// applyMentionSelection replaces the @trigger and partial query in the
+// textarea with the currently highlighted file path.
+func (m Model) applyMentionSelection() (tea.Model, tea.Cmd) {
+	newVal, cursor := m.mention.insert(m.textarea.Value())
+	m.textarea.SetValue(newVal)
+	m.textarea.SetCursor(cursor)
+	m.mention.active = false
+	m.state = stateInput
+	return m, nil
+}
+
+// computeToolDiff produces a coloured diff for a file edit/write card.
+// For a write, we use the file's current contents (after the write) as
+// the "new" side and an empty string as "old" — that lets the user
+// review the new file contents. For an edit, we attempt to read the
+// original content from .claude/edit_previews/<id>.txt (a side-channel
+// the runtime writes before applying the change); if that file is
+// missing we just show the model's `new_string` input as additions.
+func (m Model) computeToolDiff(c toolCard) string {
+	// Pull the path and the new content from the card input. The input
+	// is a JSON-shaped blob in the runtime; we don't try to fully
+	// parse it here — we look for a "path" key and a "content" or
+	// "new_string" key. If we can't find one we render a short stub.
+	idx := strings.Index(c.input, `"path"`)
+	path := ""
+	if idx != -1 {
+		path = extractJSONString(c.input[idx:])
+	}
+	newContent := ""
+	if nci := strings.Index(c.input, `"new_string"`); nci != -1 {
+		newContent = extractJSONString(c.input[nci:])
+	} else if ci := strings.Index(c.input, `"content"`); ci != -1 {
+		newContent = extractJSONString(c.input[ci:])
+	}
+	if path == "" && newContent == "" {
+		return ""
+	}
+	// Read the previous version (if available). For write tools this
+	// is empty; for edit tools we look for a side-channel.
+	var oldContent string
+	if c.name == "edit" || c.name == "file_edit" {
+		// Best effort: try a couple of well-known paths.
+		for _, p := range []string{".claude/edit_previews/" + c.id + ".txt", path + ".bak"} {
+			if data, err := os.ReadFile(p); err == nil {
+				oldContent = string(data)
+				break
+			}
+		}
+	}
+	return inlineDiff(path, oldContent, newContent)
+}
+
+// extractJSONString pulls the value of a string field out of a JSON
+// fragment. The runtime's tool input is a free-form blob so we do a
+// minimal scan: find the colon after the key, the opening quote, and
+// the matching closing quote (handling \" and \\ escapes).
+func extractJSONString(s string) string {
+	colon := strings.Index(s, ":")
+	if colon == -1 {
+		return ""
+	}
+	rest := s[colon+1:]
+	for i := 0; i < len(rest); i++ {
+		if rest[i] == '"' {
+			var b strings.Builder
+			for j := i + 1; j < len(rest); j++ {
+				c := rest[j]
+				if c == '\\' && j+1 < len(rest) {
+					next := rest[j+1]
+					switch next {
+					case 'n':
+						b.WriteByte('\n')
+					case 't':
+						b.WriteByte('\t')
+					case '"':
+						b.WriteByte('"')
+					case '\\':
+						b.WriteByte('\\')
+					default:
+						b.WriteByte(next)
+					}
+					j++
+					continue
+				}
+				if c == '"' {
+					return b.String()
+				}
+				b.WriteByte(c)
+			}
+			return b.String()
+		}
+		if rest[i] != ' ' && rest[i] != '\t' && rest[i] != '\n' {
+			return ""
+		}
+	}
+	return ""
+}
+
+// renderToolCards renders the in-progress tool cards into a string.
+// Used when toggling expansion so the streaming view stays in sync.
+func (m Model) renderToolCards() string {
+	var b strings.Builder
+	for _, c := range m.toolCards {
+		b.WriteString(formatToolCard(c))
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+// refreshTodosFromDisk re-reads `.claude/todos.json` and updates the
+// todo panel. Called whenever the agent runs todo_write so the panel
+// reflects progress without us adding a dedicated event.
+func (m Model) refreshTodosFromDisk() {
+	data, err := os.ReadFile(".claude/todos.json")
+	if err != nil {
+		return
+	}
+	var items []struct {
+		ID       string `json:"id"`
+		Content  string `json:"content"`
+		Status   string `json:"status"`
+		Priority string `json:"priority"`
+	}
+	if err := json.Unmarshal(data, &items); err != nil {
+		return
+	}
+	conv := make([]todoItem, len(items))
+	for i, it := range items {
+		conv[i] = todoItem{id: it.ID, content: it.Content, status: it.Status, priority: it.Priority}
+	}
+	m.todoPanel.setItems(conv)
+}
+
 // handlePickerKey handles keys when the model picker overlay is shown.
 func (m Model) handlePickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	models := m.activeModels()
@@ -1124,15 +1556,22 @@ func (m Model) View() string {
 		return m.viewLoginAPIKey()
 	case stateLoginOAuth:
 		return m.viewLoginOAuth()
+	case statePalette:
+		return m.palette.view(m.width, m.height)
+	case stateSessionPicker:
+		return m.sessionPicker.view(m.width, m.height)
 	}
 
 	header := m.renderHeader()
 	divider := dividerStyle.Render(strings.Repeat("─", m.width))
-	hint := statusStyle.Render("Enter=send  Ctrl+J=newline  ↑↓=history  PgUp/PgDn=scroll")
+	hint := statusStyle.Render("Enter=send  Ctrl+J=newline  ↑↓=history  Ctrl+P=palette  Shift+Tab=mode  Ctrl+T=expand")
 	statusLine := m.renderStatusBar()
 	inputArea := m.renderInputArea()
 
-	return lipgloss.JoinVertical(lipgloss.Left,
+	// Compose the main column (header, viewport, divider, input, hint, status).
+	// When the todo panel is active on a wide terminal, lay it out as a
+	// two-column row so the conversation can scroll beside the tasks.
+	mainCol := lipgloss.JoinVertical(lipgloss.Left,
 		header,
 		m.viewport.View(),
 		divider,
@@ -1140,6 +1579,29 @@ func (m Model) View() string {
 		hint,
 		statusLine,
 	)
+
+	if m.todoPanel.isVisible() && m.width >= 100 {
+		sidebar := lipgloss.NewStyle().Width(m.todoPanel.width).Render(
+			m.todoPanel.view(m.viewportHeight()),
+		)
+		body := lipgloss.JoinHorizontal(lipgloss.Top,
+			lipgloss.NewStyle().Width(m.width-m.todoPanel.width-2).Render(mainCol),
+			"  ",
+			sidebar,
+		)
+		out := body
+		// Mention popup sits over the input area on top of everything.
+		if m.state == stateMention {
+			out = lipgloss.JoinVertical(lipgloss.Left, out, m.mention.view(m.width, m.height))
+		}
+		return out
+	}
+
+	out := mainCol
+	if m.state == stateMention {
+		out = lipgloss.JoinVertical(lipgloss.Left, out, m.mention.view(m.width, m.height))
+	}
+	return out
 }
 
 func (m Model) renderHeader() string {
@@ -1149,14 +1611,25 @@ func (m Model) renderHeader() string {
 }
 
 func (m Model) renderStatusBar() string {
-	if m.inputTokens > 0 || m.outputTokens > 0 {
-		return statusStyle.Render(fmt.Sprintf(
-			"Tokens: %s in / %s out  │  Session: %s",
-			formatNum(m.inputTokens), formatNum(m.outputTokens),
-			m.loop.Session.ID,
-		))
+	mode := "default"
+	if m.loop != nil && m.loop.PermManager != nil {
+		mode = m.loop.PermManager.Mode.String()
 	}
-	return statusStyle.Render("Session: " + m.loop.Session.ID)
+	modeBadge := modeBadgeStyle.Render("[" + mode + "]")
+	if m.inputTokens > 0 || m.outputTokens > 0 {
+		return lipgloss.JoinHorizontal(lipgloss.Left,
+			modeBadge,
+			statusStyle.Render(fmt.Sprintf(
+				"  Tokens: %s in / %s out  │  Session: %s",
+				formatNum(m.inputTokens), formatNum(m.outputTokens),
+				m.loop.Session.ID,
+			)),
+		)
+	}
+	return lipgloss.JoinHorizontal(lipgloss.Left,
+		modeBadge,
+		statusStyle.Render("  Session: "+m.loop.Session.ID),
+	)
 }
 
 // renderInputArea renders the multi-line input with a "> " prefix on the first line.
